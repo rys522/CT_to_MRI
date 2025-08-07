@@ -1,10 +1,10 @@
-# MNIST Example: Comparison of Various Diffusion Methods
-# Code for the Diffusion Study Group for LIST
+# CT_to_MRI coversion code using different diffusion models
+# Code for the Internship program for LIST
 
 # Recommende to install Ruff & Black extension in VScode
 
 ## Data preparation
-run scripts/1_datadown.ipynb
+use Synthrad 2023
 
 ## Training
 python train.py --gpu {gpu}  # Other parameters can be set in GeneralConfig or ModelConfig
@@ -14,9 +14,10 @@ python train.py --gpu {gpu}  # Other parameters can be set in GeneralConfig or M
 python test.py --gpu {gpu}  # Other parameters can be set in TestConfig
 
 ## Author
+Yoonseok Ra
 Juhyung Park  
 Laboratory for Imaging Science and Technology  
 Seoul National University  
-Email: jack0878@snu.ac.kr
+Email: rys522@snu.ac.kr
 
 # CT_to_MRI
