@@ -45,6 +45,8 @@ def check_nan(arr, name=""):
     if np.isnan(arr).any():
         logger.debug(f"⚠️ NaN detected in {name} (shape={arr.shape})")
         return -1
+    else:
+        return 0
 
 
 def collate_remove_none(batch):
@@ -165,6 +167,11 @@ class DataWrapper(Dataset):
             mri_slice = mri[slice_idx, :, :]
             ct_slice = ct[slice_idx, :, :]
             mask_slice = mask[slice_idx, :, :] if self.mask is not None else None
+
+        if check_nan(mri_slice, "mr") == -1:
+            return None, None, None, None
+        if check_nan(ct_slice, "ct_slice") == -1:
+            return None, None, None, None
 
         mri = torch.from_numpy(mri_slice).float().unsqueeze(0)
         ct = torch.from_numpy(ct_slice).float().unsqueeze(0)
