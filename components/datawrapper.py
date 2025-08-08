@@ -28,17 +28,37 @@ def sigmoid_soft_clip(ct_norm: np.ndarray, scale: float = 0.1) -> np.ndarray:
     return ct_sigmoid
 
 
-def norm(x):
-    if np.max(x) > 0:
-        return (x - np.min(x)) / (np.max(x) - np.min(x))
-    return x
+def norm(x, mask):
+    mask_region = x[mask > 0]
+    if mask_region.size == 0:
+        return x
+    max_val = np.max(mask_region)
+    min_val = np.min(mask_region)
+    x_norm = np.zeros_like(x, dtype=np.float32)
+    x_norm[mask > 0] = (mask_region - min_val) / (max_val - min_val + 1e-8)
+    return x_norm
 
 
-def norm_mri(mri: np.ndarray) -> np.ndarray:
-    std = np.std(mri)
-    if std > 0:
-        return mri / std
-    return mri
+def norm_mri(mri: np.ndarray, mask: np.ndarray) -> np.ndarray:
+    if mask is not None:
+        region = mri[mask > 0]
+        if region.size == 0:
+            return mri
+        std = np.std(region)
+        if std > 0:
+            mri_norm = mri.copy()
+            mri_norm[mask > 0] = region / (std + 1e-8)
+            mri_norm[mask == 0] = 0
+            return mri_norm
+        else:
+            mri_out = mri.copy()
+            mri_out[mask == 0] = 0
+            return mri_out
+    else:
+        std = np.std(mri)
+        if std > 0:
+            return mri / (std)
+        return mri
 
 
 def check_nan(arr, name=""):
@@ -47,6 +67,10 @@ def check_nan(arr, name=""):
         return -1
     else:
         return 0
+
+
+def is_all_zero(x: np.ndarray) -> bool:
+    return np.count_nonzero(x) == 0
 
 
 def collate_remove_none(batch):
@@ -63,27 +87,19 @@ class DataWrapper(Dataset):
 
     def __init__(
         self,
-        file_path: tuple[str, str],
+        file_path: str,
         config: GeneralConfig,
-        mask_path: Optional[str] = None,
         training_mode: bool = True,
         debug_mode: bool = False,
     ):
         super().__init__()
-        mri_path, ct_path = file_path
 
         self.config = config
 
-        with h5py.File(mri_path, "r") as f:
-            self.mri = f["data"][:]
-        with h5py.File(ct_path, "r") as f:
-            self.ct = f["data"][:]
-
-        if mask_path:
-            with h5py.File(mask_path, "r") as f:
-                self.mask = f["data"][:]
-        else:
-            self.mask = None
+        with h5py.File(file_path, "r") as f:
+            self.mri = f["mri"][:]
+            self.ct = f["ct"][:]
+            self.mask = f["mask"][:] if "mask" in f else None
 
         assert self.mri.shape == self.ct.shape, "MRI and CT shapes must match"
         if self.mask is not None:
@@ -94,35 +110,6 @@ class DataWrapper(Dataset):
         ct_clip = self.config.ct_clip
         scale = self.config.scale
 
-        for subj_idx in range(n):
-            mri = np.rot90(self.mri[subj_idx, :, :, :], k=3, axes=(0, 1))
-            ct = np.rot90(self.ct[subj_idx, :, :, :], k=3, axes=(0, 1))
-            mask = (
-                np.rot90(self.mask[subj_idx, :, :, :], k=3, axes=(0, 1))
-                if self.mask is not None
-                else None
-            )
-            if mask is not None:
-                mask = (mask > 0).astype(np.float32)
-                mri = mri * mask
-
-            ct_slice_hard = mask_soft_tissue_only(
-                ct, mask, min_hu=ct_clip[0], max_hu=ct_clip[1]
-            )
-
-            ct_slice_hard = norm(ct_slice_hard)
-
-            ct_slice_soft = sigmoid_soft_clip(ct_slice_hard, scale=scale)
-
-            mri = norm_mri(mri)
-            ct = norm(ct_slice_soft)
-
-            self.ct[subj_idx, :, :, :] = np.nan_to_num(ct, nan=0.0)
-            self.mri[subj_idx, :, :, :] = np.nan_to_num(mri, nan=0.0)
-
-        self.training_mode = training_mode
-
-        n, x_dim, y_dim, z_dim = self.ct.shape
         self.num_subj = n
 
         if self.config.axes == "z":
@@ -134,50 +121,96 @@ class DataWrapper(Dataset):
         else:
             raise ValueError(f"Unknown axis {self.config.axes!r}")
 
-        total = self.num_subj * self.num_slices
+        self.valid_slices = []
+
+        for subj_idx in range(n):
+            mri = self.mri[subj_idx, :, :, :]
+            ct = self.ct[subj_idx, :, :, :]
+            mask = self.mask[subj_idx, :, :, :] if self.mask is not None else None
+
+            if mask is not None:
+                mask = (mask > 0).astype(np.float32)
+                mri = mri * mask
+
+            ct_hard = mask_soft_tissue_only(
+                ct, mask, min_hu=ct_clip[0], max_hu=ct_clip[1]
+            )
+            ct_hard = norm(ct_hard, mask)
+            ct_soft = sigmoid_soft_clip(ct_hard, scale=scale)
+
+            mri = norm_mri(mri, mask)
+            ct = norm(ct_soft, mask)
+
+            for slice_idx in range(self.num_slices):
+                mri_slice, ct_slice, mask_slice = self._get_slice_arrays(
+                    slice_idx, mri, ct, mask
+                )
+                if (
+                    check_nan(mri_slice, "MRI slice") < 0
+                    or check_nan(ct_slice, "CT slice") < 0
+                    or (
+                        mask_slice is not None
+                        and check_nan(mask_slice, "Mask slice") < 0
+                    )
+                ):
+                    continue
+                if (
+                    is_all_zero(mri_slice)
+                    or is_all_zero(ct_slice)
+                    or (mask_slice is not None and is_all_zero(mask_slice))
+                ):
+                    continue
+                self.valid_slices.append((mri_slice, ct_slice, mask_slice))
+
+        self.training_mode = training_mode
         if debug_mode:
-            total = min(total, 1000 if training_mode else 100)
+            self.valid_slices = self.valid_slices[: (1000 if training_mode else 100)]
 
-        self.data_len = total
+        self.data_len = len(self.valid_slices)
 
-        self.blur = transforms.GaussianBlur(kernel_size=7)
+    def _get_slice_arrays(self, slice_idx, mri, ct, mask):
+        if self.config.axes == "z":
+            return (
+                np.rot90(mri[:, :, slice_idx], k=3).copy(),
+                np.rot90(ct[:, :, slice_idx], k=3).copy(),
+                (
+                    np.rot90(mask[:, :, slice_idx], k=3).copy()
+                    if mask is not None
+                    else None
+                ),
+            )
+        elif self.config.axes == "y":
+            return (
+                np.rot90(mri[:, slice_idx, :], k=1).copy(),
+                np.rot90(ct[:, slice_idx, :], k=1).copy(),
+                (
+                    np.rot90(mask[:, slice_idx, :], k=1).copy()
+                    if mask is not None
+                    else None
+                ),
+            )
+        elif self.config.axes == "x":
+            return (
+                np.rot90(mri[slice_idx, :, :], k=1).copy(),
+                np.rot90(ct[slice_idx, :, :], k=1).copy(),
+                (
+                    np.rot90(mask[slice_idx, :, :], k=1).copy()
+                    if mask is not None
+                    else None
+                ),
+            )
 
     def __getitem__(self, idx):
 
-        subj_idx = idx // self.num_slices
-        slice_idx = idx % self.num_slices
-
-        mri = self.mri[subj_idx, :, :, :]
-        ct = self.ct[subj_idx, :, :, :]
-        mask = self.mask[subj_idx, :, :, :] if self.mask is not None else None
-
-        if self.config.axes == "z":
-            mri_slice = mri[:, :, slice_idx]
-            ct_slice = ct[:, :, slice_idx]
-            mask_slice = mask[:, :, slice_idx] if self.mask is not None else None
-
-        elif self.config.axes == "y":
-            # shape (X, Z)
-            mri_slice = mri[:, slice_idx, :]
-            ct_slice = ct[:, slice_idx, :]
-            mask_slice = mask[:, slice_idx, :] if self.mask is not None else None
-
-        elif self.config.axes == "x":
-            # shape (Y, Z)
-            mri_slice = mri[slice_idx, :, :]
-            ct_slice = ct[slice_idx, :, :]
-            mask_slice = mask[slice_idx, :, :] if self.mask is not None else None
-
-        if check_nan(mri_slice, "mr") == -1:
-            return None, None, None, None
-        if check_nan(ct_slice, "ct_slice") == -1:
-            return None, None, None, None
+        mri_slice, ct_slice, mask_slice = self.valid_slices[idx]
 
         mri = torch.from_numpy(mri_slice).float().unsqueeze(0)
         ct = torch.from_numpy(ct_slice).float().unsqueeze(0)
 
-        if mask is not None:
+        if mask_slice is not None:
             mask = torch.from_numpy(mask_slice).float().unsqueeze(0)
+        else:
+            mask = None
 
         # Augmentation
         if self.training_mode:
@@ -202,7 +235,7 @@ class DataWrapper(Dataset):
 
 
 def get_data_wrapper_loader(
-    file_path: tuple[str, str] | tuple[str, str, str],
+    file_path: str,
     config: GeneralConfig,
     training_mode: bool = True,
     batch: int = 1,
@@ -211,12 +244,9 @@ def get_data_wrapper_loader(
     debug_mode: bool = False,
 ):
 
-    mask_path = file_path[2] if len(file_path) == 3 else None
-
     dataset = DataWrapper(
-        file_path=file_path[:2],
+        file_path=file_path,
         config=config,
-        mask_path=mask_path,
         training_mode=training_mode,
         debug_mode=debug_mode,
     )
